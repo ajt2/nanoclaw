@@ -290,6 +290,79 @@ function formatTranscriptMarkdown(
 }
 
 /**
+ * Parse a simple KEY=VALUE env file into a record.
+ */
+function parseEnvFile(filePath: string): Record<string, string> {
+  try {
+    const lines = fs.readFileSync(filePath, 'utf-8').split('\n');
+    const result: Record<string, string> = {};
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx === -1) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      let val = trimmed.slice(eqIdx + 1).trim();
+      if (val.length >= 2 && ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'")))) {
+        val = val.slice(1, -1);
+      }
+      if (key) result[key] = val;
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Load extra MCP servers from /workspace/project/.mcp.json.
+ * Expands ${VAR} references using data/env/env first, then process.env.
+ */
+function loadProjectMcpServers(): Record<
+  string,
+  { command: string; args?: string[]; env?: Record<string, string> }
+> {
+  const mcpPath = '/workspace/project/.mcp.json';
+  if (!fs.existsSync(mcpPath)) return {};
+
+  // Load env values from data/env/env for ${VAR} expansion
+  const fileEnv = parseEnvFile('/workspace/project/data/env/env');
+  const resolveVar = (varName: string): string =>
+    fileEnv[varName] ?? process.env[varName] ?? '';
+
+  try {
+    const raw = JSON.parse(fs.readFileSync(mcpPath, 'utf-8')) as {
+      mcpServers?: Record<
+        string,
+        { command: string; args?: string[]; env?: Record<string, string> }
+      >;
+    };
+    const servers = raw.mcpServers ?? {};
+
+    const expanded: typeof servers = {};
+    for (const [name, config] of Object.entries(servers)) {
+      const expandedEnv: Record<string, string> = {};
+      for (const [key, val] of Object.entries(config.env ?? {})) {
+        expandedEnv[key] = val.replace(
+          /\$\{([^}]+)\}/g,
+          (_, varName: string) => resolveVar(varName),
+        );
+      }
+      expanded[name] = { ...config, env: expandedEnv };
+    }
+
+    const names = Object.keys(expanded);
+    if (names.length > 0) {
+      log(`Loaded project MCP servers: ${names.join(', ')}`);
+    }
+    return expanded;
+  } catch (err) {
+    log(`Failed to load .mcp.json: ${err instanceof Error ? err.message : String(err)}`);
+    return {};
+  }
+}
+
+/**
  * Check for _close sentinel.
  */
 function shouldClose(): boolean {
@@ -438,6 +511,7 @@ async function runQuery(
   for await (const message of query({
     prompt: stream,
     options: {
+      model: 'claude-haiku-4-5-20251001',
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
@@ -469,6 +543,7 @@ async function runQuery(
         'Skill',
         'NotebookEdit',
         'mcp__nanoclaw__*',
+        ...Object.keys(loadProjectMcpServers()).map((n) => `mcp__${n}__*`),
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -484,6 +559,7 @@ async function runQuery(
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
+        ...loadProjectMcpServers(),
       },
       hooks: {
         PreCompact: [
